@@ -1,4 +1,4 @@
-import os, json, httpx, asyncio
+import os, json
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -7,133 +7,85 @@ import anthropic
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
 
 class ResearchRequest(BaseModel):
     business_name: str
     website_url: str = ""
 
-async def web_search(query: str) -> str:
-    try:
-        async with httpx.AsyncClient(timeout=8) as http:
-            r = await http.get(
-                "https://api.duckduckgo.com/",
-                params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1}
-            )
-            data = r.json()
-            results = []
-            if data.get("AbstractText"):
-                results.append(data["AbstractText"])
-            for topic in data.get("RelatedTopics", [])[:3]:
-                if isinstance(topic, dict) and topic.get("Text"):
-                    results.append(topic["Text"])
-            return " | ".join(results) if results else "No results"
-    except Exception as e:
-        return f"Search unavailable: {e}"
-
-async def fetch_website(url: str) -> str:
-    if not url:
-        return ""
-    if not url.startswith("http"):
-        url = "https://" + url
-    try:
-        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as http:
-            headers = {"User-Agent": "Mozilla/5.0 (compatible; research-bot/1.0)"}
-            r = await http.get(url, headers=headers)
-            text = r.text
-            # Strip HTML tags roughly
-            import re
-            clean = re.sub(r'<[^>]+>', ' ', text)
-            clean = re.sub(r'\s+', ' ', clean).strip()
-            return clean[:4000]
-    except Exception as e:
-        return f"Could not fetch: {e}"
-
 @app.post("/research")
 async def research(req: ResearchRequest):
     name = req.business_name.strip()
     url = req.website_url.strip()
+    url_hint = f" (website: {url})" if url else ""
 
-    # Determine URL if not provided
-    guessed_url = url
-    if not guessed_url:
-        slug = name.lower().replace(" ", "").replace("&", "and")
-        guessed_url = f"https://www.{slug}.com.au"
+    prompt = f"""Research the business "{name}"{url_hint} using web search.
 
-    # Run searches and fetch in parallel
-    search_q1 = f'"{name}" business AI automation systems'
-    search_q2 = f'"{name}" reviews services pricing'
+Find:
+- What they actually do, who their customers are, rough size
+- Their website, socials, any press or reviews
+- Their current tech stack (booking system, CRM, website platform, email tool)
+- Where their business is leaking time or money - be specific, not generic
+- The decision maker's name and title if findable
 
-    search1, search2, homepage = await asyncio.gather(
-        web_search(search_q1),
-        web_search(search_q2),
-        fetch_website(guessed_url)
-    )
-
-    # Claude analysis
-    prompt = f"""You are an AI business intelligence analyst. Research this business and return a JSON object.
-
-Business: {name}
-URL attempted: {guessed_url}
-Web search 1: {search1}
-Web search 2: {search2}
-Website content (first 4000 chars): {homepage[:3000] if homepage else 'Could not fetch'}
-
-Return ONLY valid JSON, no markdown, no explanation:
+Then return ONLY valid JSON (no markdown, no explanation):
 
 {{
-  "company_name": "...",
-  "industry": "...",
-  "description": "2-3 sentence summary of what this business does",
-  "business_model": "one of: service-based, e-commerce, SaaS, consulting, healthcare, retail, hospitality, other",
-  "estimated_revenue": "rough estimate e.g. $500K-$2M",
-  "team_size": "rough estimate e.g. 10-50",
+  "company_name": "actual name",
+  "industry": "specific industry",
+  "description": "2-3 sentences describing what they actually do based on what you found",
+  "business_model": "service-based | e-commerce | SaaS | consulting | healthcare | retail | hospitality | other",
+  "estimated_revenue": "your best estimate e.g. $500K-$2M",
+  "team_size": "your best estimate e.g. 10-50 staff",
   "key_decision_maker": {{
-    "name": "best guess or 'Unknown'",
-    "title": "CEO/Owner/Director/etc"
+    "name": "actual name found or Unknown",
+    "title": "their actual title"
   }},
-  "current_tech_stack": ["list", "of", "tools", "detected"],
+  "current_tech_stack": ["real tools you found evidence of"],
   "pain_points": [
-    "specific pain point 1 - something AI could fix",
-    "specific pain point 2",
-    "specific pain point 3"
+    "Specific pain point based on what you found - tie it to something real on their website or in reviews",
+    "Another specific one",
+    "Third one"
   ],
-  "biggest_opportunity": "The single biggest thing an AI operating system could do for this business",
+  "biggest_opportunity": "The single highest-ROI thing an AI operating system could do for this specific business",
   "intent_score": 75,
-  "route": "one of: AIOS ($5K base), Aria Voice Agent, A&A Membership, Not a fit",
-  "email_subject": "compelling subject line personalised to this business",
-  "email_body": "A short, personalised outreach email (4-6 sentences). From Kelly Wotherspoon at AI with Soul. Reference their specific business. Mention one pain point. Mention a live AIOS demo is available. Warm, direct, no fluff. Sign off Kelly x"
+  "route": "AIOS ($5K base) | Aria Voice Agent | A&A Membership | Not a fit",
+  "email_subject": "Subject line that references something specific about their business",
+  "email_body": "Short outreach email (4-5 sentences). From Kelly Wotherspoon at AI with Soul. Reference one specific real thing you found about them. Name the pain point. Offer a live AIOS demo. Warm, direct. No AI-sounding phrases. Sign off Kelly x"
 }}"""
 
-    message = client.messages.create(
+    # Use Claude with web search tool enabled - real research, no fake data
+    response = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=1500,
+        max_tokens=2000,
+        tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 4}],
         messages=[{"role": "user", "content": prompt}]
     )
 
-    raw = message.content[0].text.strip()
-    # Strip markdown code fences if present
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    raw = raw.strip()
+    # Extract the final text response (after tool use)
+    raw = ""
+    for block in response.content:
+        if hasattr(block, "text"):
+            raw = block.text.strip()
+
+    # Find JSON object anywhere in the response
+    start = raw.find("{")
+    end = raw.rfind("}") + 1
+    if start != -1 and end > start:
+        raw = raw[start:end]
 
     try:
-        data = json.loads(raw)
+        return json.loads(raw)
     except Exception:
-        data = {
+        return {
             "company_name": name,
-            "description": "Research completed - see details below.",
-            "pain_points": ["Manual processes slowing growth", "No automated lead follow-up", "Content creation taking too much time"],
-            "email_subject": f"AI Operating System for {name}",
-            "email_body": raw[:500],
+            "description": raw[:300] if raw else "Research completed.",
+            "pain_points": ["Manual processes slowing growth", "No automated follow-up", "Content bottleneck"],
+            "email_subject": f"Quick question about {name}",
+            "email_body": f"Hi,\n\nI came across {name} and I'd love to show you what an AI operating system could do for your business.\n\nWorth a 20-minute call?\n\nKelly x",
             "intent_score": 65,
             "route": "AIOS ($5K base)"
         }
-
-    return data
 
 @app.get("/health")
 async def health():
